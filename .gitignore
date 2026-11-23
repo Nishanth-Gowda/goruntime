@@ -1,0 +1,7 @@
+/demo
+/fakeecs
+/gcbench
+*.test
+*.out
+*.pprof
+.DS_Store
