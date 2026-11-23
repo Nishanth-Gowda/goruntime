@@ -170,6 +170,13 @@ func TestMetricsHandler(t *testing.T) {
 	rec := httptest.NewRecorder()
 	rt.MetricsHandler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
 	body := rec.Body.String()
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	rec2 := httptest.NewRecorder()
+	rt.MetricsHandler().ServeHTTP(rec2, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rec2.Body.String(), "\ngo_gc_gogc_percent -1\n") {
+		t.Error("GOGC=off should be exported as go_gc_gogc_percent -1")
+	}
+
 	for _, want := range []string{
 		"go_gc_cycles_total_gc_cycles ",
 		"go_cpu_classes_gc_total_cpu_seconds ",

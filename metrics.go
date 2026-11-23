@@ -59,7 +59,13 @@ func writeRuntimeMetrics(w *bufio.Writer) {
 		switch s.Value.Kind() {
 		case metrics.KindUint64:
 			writeHeader(w, name, help, counterOrGauge(d))
-			fmt.Fprintf(w, "%s %d\n", name, s.Value.Uint64())
+			v := s.Value.Uint64()
+			// /gc/gogc:percent is a uint64, so GOGC=off (-1) wraps to MaxUint64.
+			if d.Name == "/gc/gogc:percent" && v == math.MaxUint64 {
+				fmt.Fprintf(w, "%s -1\n", name)
+			} else {
+				fmt.Fprintf(w, "%s %d\n", name, v)
+			}
 		case metrics.KindFloat64:
 			writeHeader(w, name, help, counterOrGauge(d))
 			fmt.Fprintf(w, "%s %g\n", name, s.Value.Float64())
