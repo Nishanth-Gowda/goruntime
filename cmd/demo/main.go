@@ -16,13 +16,14 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Nishanth-Gowda/goruntime"
 )
 
-var sink [][]byte
+var sink atomic.Pointer[[]byte] // atomic: handlers run concurrently
 
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
@@ -51,7 +52,10 @@ func main() {
 		for i := 0; i < mb*16; i++ {
 			buf = append(buf, make([]byte, 64<<10))
 		}
-		sink = buf[:1] // keep a little, drop the rest
+		// Keep one 64 KiB buffer so the work isn't optimized away. Storing
+		// buf[:1] would keep the whole backing array (and every buffer) alive.
+		keep := buf[0]
+		sink.Store(&keep)
 		w.Write([]byte("ok\n"))
 	})
 
