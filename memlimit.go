@@ -62,10 +62,7 @@ func ComputeMemLimit(s Snapshot, p MemLimitPolicy) uint64 {
 
 	ceiling := static
 	if s.TaskMemoryLimit > 0 {
-		others := uint64(0)
-		if s.TaskMemoryUsage > s.ContainerMemoryUsage {
-			others = s.TaskMemoryUsage - s.ContainerMemoryUsage
-		}
+		others := s.othersMemoryUsage()
 		if others < s.TaskMemoryLimit {
 			if avail := s.TaskMemoryLimit - others; avail < ceiling {
 				ceiling = avail
@@ -81,6 +78,15 @@ func ComputeMemLimit(s Snapshot, p MemLimitPolicy) uint64 {
 		limit = floor
 	}
 	return limit
+}
+
+// othersMemoryUsage is the working set of every container in the task except
+// this one (sidecars).
+func (s Snapshot) othersMemoryUsage() uint64 {
+	if s.TaskMemoryUsage > s.ContainerMemoryUsage {
+		return s.TaskMemoryUsage - s.ContainerMemoryUsage
+	}
+	return 0
 }
 
 // CPULimit returns the CPU hard limit to size GOMAXPROCS from. The task-level

@@ -139,6 +139,7 @@ func (r *Runtime) writeLimitMetrics(w *bufio.Writer) {
 	g("goruntime_task_memory_usage_bytes", "Working set of all containers in the task.", float64(st.Snapshot.TaskMemoryUsage))
 	g("goruntime_container_memory_limit_bytes", "This container's memory hard limit (0 = unset).", float64(st.Snapshot.ContainerMemoryLimit))
 	g("goruntime_container_memory_usage_bytes", "This container's working set.", float64(st.Snapshot.ContainerMemoryUsage))
+	g("goruntime_others_memory_peak_bytes", "Peak working set of the other containers in the task over the peak window; GOMEMLIMIT is sized from this.", float64(st.OthersMemoryPeak))
 	if st.Snapshot.TaskMemoryLimit > 0 {
 		g("goruntime_task_memory_utilization_ratio", "Task memory usage / limit.",
 			float64(st.Snapshot.TaskMemoryUsage)/float64(st.Snapshot.TaskMemoryLimit))

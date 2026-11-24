@@ -201,3 +201,78 @@ func TestMetricsHandler(t *testing.T) {
 		}
 	}
 }
+
+func TestPeakWindow(t *testing.T) {
+	t0 := time.Unix(0, 0)
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	p := peakWindow{window: time.Minute}
+	steps := []struct {
+		sec  int
+		v    uint64
+		want uint64
+	}{
+		{0, 100, 100},
+		{10, 300, 300}, // grows: new peak at once
+		{20, 50, 300},  // shrinks: peak held
+		{69, 40, 300},  // 300@10s still inside (9s, 69s]
+		{75, 40, 50},   // 300 expired; 50@20s is the peak now
+		{81, 40, 40},   // 50 expired too
+		{90, 500, 500},
+	}
+	for _, s := range steps {
+		if got := p.add(at(s.sec), s.v); got != s.want {
+			t.Fatalf("t=%ds add(%d)=%d want %d", s.sec, s.v, got, s.want)
+		}
+	}
+	if got := (&peakWindow{}).add(t0, 7); got != 7 {
+		t.Fatalf("no window should return the latest value, got %d", got)
+	}
+}
+
+func TestRuntimeShrinksFastGrowsSlow(t *testing.T) {
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(-1))
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	now := time.Unix(0, 0)
+	snap := func(othersMiB uint64) Snapshot {
+		return Snapshot{
+			Source: "ecs", TaskMemoryLimit: 1000 * mib,
+			ContainerMemoryUsage: 200 * mib, TaskMemoryUsage: (200 + othersMiB) * mib,
+		}
+	}
+	rt, err := Start(context.Background(), Config{
+		Interval:        time.Hour, // the loop never fires; the test drives apply
+		FastInterval:    time.Minute,
+		PeakWindow:      2 * time.Minute,
+		DisableMaxProcs: true,
+		snapshotFn:      func(context.Context) (Snapshot, error) { return snap(100), nil },
+		now:             func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Stop()
+	step := func(d time.Duration, othersMiB, wantMiB uint64, wantNext time.Duration) {
+		t.Helper()
+		now = now.Add(d)
+		next := rt.apply(snap(othersMiB), false)
+		if got := rt.State().MemoryLimit; got != wantMiB*mib {
+			t.Fatalf("others=%d MiB: limit %d MiB, want %d", othersMiB, got/mib, wantMiB)
+		}
+		if next != wantNext {
+			t.Fatalf("others=%d MiB: next refresh in %v, want %v", othersMiB, next, wantNext)
+		}
+	}
+	if got := rt.State().MemoryLimit; got != 810*mib { // (1000-100)*0.9
+		t.Fatalf("initial limit %d MiB", got/mib)
+	}
+	step(10*time.Second, 400, 540, time.Minute) // sidecar grows: shrink now, poll fast
+	step(10*time.Second, 400, 540, time.Hour)   // steady: back to normal polling
+	step(10*time.Second, 100, 540, time.Hour)   // sidecar shrinks: hold the limit
+	step(90*time.Second, 100, 540, time.Hour)   // last 400 reading (t=20s) is 100s old: still held
+	step(25*time.Second, 100, 810, time.Hour)   // 125s old, past the 2m window: give memory back
+	step(10*time.Second, 105, 810, time.Hour)   // +5 MiB < 1% of task: no fast poll, change skipped
+	if got := rt.State().OthersMemoryPeak; got != 105*mib {
+		t.Fatalf("OthersMemoryPeak %d MiB", got/mib)
+	}
+}
