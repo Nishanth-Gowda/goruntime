@@ -28,12 +28,13 @@ var sink atomic.Pointer[[]byte] // atomic: handlers run concurrently
 func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	interval := flag.Duration("interval", 10*time.Second, "limit refresh interval")
+	peakWindow := flag.Duration("peak-window", 2*time.Minute, "size GOMEMLIMIT from sidecars' peak usage over this window (negative = latest reading)")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	rt, _ := goruntime.Start(ctx, goruntime.Config{Interval: *interval})
+	rt, _ := goruntime.Start(ctx, goruntime.Config{Interval: *interval, PeakWindow: *peakWindow})
 	defer rt.Stop()
 
 	http.Handle("/metrics", rt.MetricsHandler())

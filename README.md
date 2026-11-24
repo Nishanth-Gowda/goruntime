@@ -34,6 +34,14 @@ GOMEMLIMIT = max(ceiling × 0.9, static × 0.5)
   Go process's limit shrinks so the task as a whole stays under its OOM line.
 - The 0.5 floor stops a greedy sidecar from pushing the limit so low that the GC
   runs all the time.
+- **Shrink fast, grow slow.** "Other containers" means their *peak* working set over
+  `Config.PeakWindow` (default 2m), not the latest reading. When a sidecar grows, the
+  limit drops on the next refresh. When it shrinks, the memory is given back only after
+  its high reading leaves the window. A sidecar whose usage swings therefore doesn't
+  drag GOMEMLIMIT up and down, and there's room for it to spike again.
+- While the other containers' usage is rising (by 1% of the task limit or more between
+  refreshes), refreshes run every `Config.FastInterval` (default `Interval/4`), so a
+  growing sidecar is caught sooner.
 - Changes smaller than 1% are skipped so the GC pacer isn't disturbed.
 - Once a limit is known, GOGC is set to **off**. Then GC runs only near the limit
   instead of each time the heap doubles, which is where the CPU savings come from.

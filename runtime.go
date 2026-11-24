@@ -25,7 +25,16 @@ import (
 type Config struct {
 	// How often to re-read usage and recompute GOMEMLIMIT. Default 10s.
 	Interval time.Duration
-	Policy   MemLimitPolicy
+	// FastInterval is used instead of Interval while the other containers'
+	// memory is rising, so a growing sidecar is caught before it pushes the
+	// task over its limit. Default Interval/4.
+	FastInterval time.Duration
+	// PeakWindow: GOMEMLIMIT is sized from the other containers' peak memory
+	// use over this window. It drops as soon as they grow, but rises again
+	// only once their usage has stayed lower for the whole window.
+	// Default 2m. Negative follows their latest reading instead.
+	PeakWindow time.Duration
+	Policy     MemLimitPolicy
 	// GCPercent applied once a memory limit is known. The big CPU savings come
 	// from letting GOMEMLIMIT, not GOGC, decide when to collect, so the default
 	// is -1 (GOGC=off). Set e.g. 100 to keep GOGC as a second trigger.
@@ -36,8 +45,9 @@ type Config struct {
 	DisableMemLimit bool
 	Logger          *slog.Logger
 
-	// For tests: override where limits come from.
+	// For tests: override where limits come from, and the clock.
 	snapshotFn func(context.Context) (Snapshot, error)
+	now        func() time.Time
 }
 
 type Runtime struct {
@@ -54,6 +64,11 @@ type Runtime struct {
 	errors     atomic.Uint64
 	gcDisabled bool
 
+	peak       peakWindow
+	othersPeak uint64 // peak other-container usage GOMEMLIMIT was sized from
+	prevOthers uint64
+	haveOthers bool
+
 	stop chan struct{}
 	done chan struct{}
 }
@@ -66,12 +81,22 @@ func Start(ctx context.Context, cfg Config) (*Runtime, error) {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
+	if cfg.FastInterval <= 0 || cfg.FastInterval > cfg.Interval {
+		cfg.FastInterval = cfg.Interval / 4
+	}
+	if cfg.PeakWindow == 0 {
+		cfg.PeakWindow = 2 * time.Minute
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
+	}
+	if cfg.now == nil {
+		cfg.now = time.Now
 	}
 	r := &Runtime{
 		cfg:  cfg,
 		log:  cfg.Logger.With("component", "goruntime"),
+		peak: peakWindow{window: cfg.PeakWindow},
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
@@ -94,9 +119,9 @@ func Start(ctx context.Context, cfg Config) (*Runtime, error) {
 		r.errors.Add(1)
 		r.log.Warn("could not read limits", "err", err)
 	}
-	r.apply(s, true)
+	next := r.apply(s, true)
 
-	go r.loop(ctx)
+	go r.loop(ctx, next)
 	return r, nil
 }
 
@@ -110,9 +135,9 @@ func defaultSnapshot() func(context.Context) (Snapshot, error) {
 	}
 }
 
-func (r *Runtime) loop(ctx context.Context) {
+func (r *Runtime) loop(ctx context.Context, next time.Duration) {
 	defer close(r.done)
-	t := time.NewTicker(r.cfg.Interval)
+	t := time.NewTimer(next)
 	defer t.Stop()
 	for {
 		select {
@@ -127,17 +152,33 @@ func (r *Runtime) loop(ctx context.Context) {
 			if err != nil {
 				r.errors.Add(1)
 				r.log.Warn("could not refresh limits", "err", err)
-				continue // keep the last good limit
+				next = r.cfg.Interval // keep the last good limit
+			} else {
+				next = r.apply(s, false)
 			}
-			r.apply(s, false)
+			t.Reset(next)
 		}
 	}
 }
 
-func (r *Runtime) apply(s Snapshot, first bool) {
+// apply records s, updates the limits, and returns how long to wait before
+// the next refresh.
+func (r *Runtime) apply(s Snapshot, first bool) time.Duration {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.last = s
+
+	// Track the other containers' usage: its peak sizes GOMEMLIMIT, and a
+	// rise of 1% of the task limit or more switches to fast polling.
+	others := s.othersMemoryUsage()
+	r.othersPeak = r.peak.add(r.cfg.now(), others)
+	rising := r.haveOthers && others > r.prevOthers &&
+		others-r.prevOthers >= s.TaskMemoryLimit/100
+	r.prevOthers, r.haveOthers = others, true
+	next := r.cfg.Interval
+	if rising && s.TaskMemoryLimit > 0 {
+		next = r.cfg.FastInterval
+	}
 
 	if first {
 		r.cpuLimit = s.CPULimit()
@@ -154,16 +195,20 @@ func (r *Runtime) apply(s Snapshot, first bool) {
 
 	if r.cfg.DisableMemLimit {
 		r.memLimit = uint64(debug.SetMemoryLimit(-1))
-		return
+		return next
 	}
-	want := ComputeMemLimit(s, r.cfg.Policy)
+	sized := s
+	if s.TaskMemoryLimit > 0 {
+		sized.TaskMemoryUsage = s.ContainerMemoryUsage + r.othersPeak
+	}
+	want := ComputeMemLimit(sized, r.cfg.Policy)
 	if want == 0 {
 		r.memLimit = uint64(debug.SetMemoryLimit(-1))
-		return
+		return next
 	}
 	// Skip tiny changes to avoid churning the GC pacer.
 	if r.memLimit != 0 && absDiff(want, r.memLimit) < r.memLimit/100 {
-		return
+		return next
 	}
 	debug.SetMemoryLimit(int64(want))
 	r.updates.Add(1)
@@ -172,6 +217,8 @@ func (r *Runtime) apply(s Snapshot, first bool) {
 		"container_limit_mib", s.ContainerMemoryLimit/mib,
 		"task_limit_mib", s.TaskMemoryLimit/mib,
 		"task_usage_mib", s.TaskMemoryUsage/mib,
+		"others_mib", others/mib,
+		"others_peak_mib", r.othersPeak/mib,
 		"source", s.Source)
 	r.memLimit = want
 
@@ -184,6 +231,7 @@ func (r *Runtime) apply(s Snapshot, first bool) {
 		r.gcDisabled = true
 		r.log.Info("set GOGC", "value", pct)
 	}
+	return next
 }
 
 func applyMaxProcsNoop() (int, bool) { return applyMaxProcs(0) }
@@ -213,6 +261,9 @@ type State struct {
 	CPULimit      float64
 	LimitUpdates  uint64
 	RefreshErrors uint64
+	// Peak memory use of the other containers in the task over PeakWindow;
+	// GOMEMLIMIT is sized from this rather than their latest reading.
+	OthersMemoryPeak uint64
 }
 
 func (r *Runtime) State() State {
@@ -229,5 +280,7 @@ func (r *Runtime) State() State {
 		CPULimit:      r.cpuLimit,
 		LimitUpdates:  r.updates.Load(),
 		RefreshErrors: r.errors.Load(),
+
+		OthersMemoryPeak: r.othersPeak,
 	}
 }
